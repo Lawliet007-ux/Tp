@@ -18,7 +18,6 @@ st.set_page_config(page_title="Legal Judgment PDF → HTML ", layout="wide")
 
 # ---------- Helpers ----------
 def to_data_url(pix):
-    """Return a PNG data URL from a PyMuPDF Pixmap."""
     img_bytes = pix.tobytes("png")
     b64 = base64.b64encode(img_bytes).decode('ascii')
     return f"data:image/png;base64,{b64}"
@@ -194,8 +193,10 @@ if uploaded is not None:
     st.download_button("Download HTML", data=html_out.encode('utf-8'),
                        file_name=os.path.splitext(uploaded.name)[0] + "_export.html", mime='text/html')
 
+    st.subheader("Raw HTML Output")
+    st.code(html_out, language="html")
+
     st.markdown("---")
     st.markdown("**If you want a closer match:**\n\n- Upload original TTF fonts used by the court (if available).\n- Increase Render DPI to 200-300.\n- If you need absolute pixel perfection for a small set of courts, share sample PDFs and I'll tune CSS and font mappings specifically for those templates.")
 else:
     st.info("Upload a PDF to begin. For best results, upload a sample judgment that you're trying to match and optionally upload its fonts.")
-
