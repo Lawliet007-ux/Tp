@@ -1,9 +1,9 @@
-streamlit 
 pymupdf 
 pdfplumber 
 pytesseract 
 pillow 
 rapidfuzz 
-openai 
 transformers 
-torch
+torch 
+tqdm 
+pandas
