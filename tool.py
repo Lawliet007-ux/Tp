@@ -1,81 +1,67 @@
-# streamlit_pii_batch.py
+# streamlit_pii_humantune.py
 """
-Streamlit FIR PII Extractor — Offline batch + uploader
-- Fully offline: uses PyMuPDF/pdfplumber + pytesseract + rapidfuzz
-- Upload PDFs or point to server folder (path on deployed instance)
-- Upload CSV to extend district/police station seeds
-- Debug mode shows intermediate candidates
-- Download JSON results or one ZIP of all outputs
+Streamlit app: FIR PII Extractor with human-in-the-loop tuning
+- Offline: PyMuPDF/pdfplumber -> Tesseract fallback
+- Multiple candidate collectors, scoring, debug output
+- Interactive correction UI: choose/enter final value per field
+- Auto-updates seeds (district / police_station) and writes gold labels (jsonl)
 """
 
 from __future__ import annotations
 import streamlit as st
-import fitz
-import pdfplumber
-import pytesseract
+import fitz, pdfplumber, pytesseract
 from PIL import Image
-import re, os, json, unicodedata, tempfile, base64, io, zipfile
+import re, os, json, unicodedata, tempfile, io
 from typing import List, Dict, Any, Optional, Tuple
 from rapidfuzz import process, fuzz
 from pathlib import Path
+import pandas as pd
 
-st.set_page_config(page_title="FIR PII Extractor (offline)", layout="wide")
+st.set_page_config(page_title="FIR PII Extractor — Human-in-the-loop", layout="wide")
 
-# ---------------------- Default seeds (extendable via CSV) -------------------
-DEFAULT_DISTRICT_SEED = [
-    "Pune","Pune City","Mumbai","Mumbai City","Nagpur","Nashik","Raigad","Meerut","Lucknow","Varanasi","Kanpur","Noida","Ghaziabad"
-]
-DEFAULT_DISTRICT_SEED_DEV = ["पुणे","मुंबई","नागपूर","नाशिक","रायगड","मेरठ","लखनऊ","वाराणसी","कानपुर"]
-DEFAULT_PS_SEED = ["Bhosari","Hadapsar","Dadar","Andheri","Colaba","Cyber Crime Cell"]
+# -------------------- Config & seeds --------------------
+SEEDS_DIR = Path("seeds")
+SEEDS_DIR.mkdir(exist_ok=True)
+GOLD_FILE = Path("gold_labels.jsonl")  # append corrections here
+SEED_DIST = SEEDS_DIR / "districts.txt"
+SEED_PS = SEEDS_DIR / "police_stations.txt"
+
+# default seeds (small — extend with CSV or let app update them)
+DEFAULT_DIST_SEED = ["Pune","Mumbai","Nagpur","Nashik","Meerut","Lucknow","Varanasi","Kanpur"]
+DEFAULT_DIST_SEED_DEV = ["पुणे","मुंबई","नागपूर","नाशिक","मेरठ","लखनऊ","वाराणसी","कानपुर"]
+DEFAULT_PS_SEED = ["Bhosari","Hadapsar","Dadar","Andheri","Colaba"]
 DEFAULT_PS_SEED_DEV = ["भोसरी","हडपसर","डादर","अंधेरी"]
-
-KNOWN_ACTS = {
-    "ipc": "Indian Penal Code 1860",
-    "information technology": "Information Technology Act 2000",
-    "it act": "Information Technology Act 2000",
-    "arms act": "Arms Act 1959",
-    "crpc": "Code of Criminal Procedure 1973",
-    "ndps": "NDPS Act 1985",
-    "pocso": "POCSO Act 2012"
-}
 
 SECTION_MAX = 999
 
-# ---------------------- Text normalization helpers ---------------------------
+# ensure seed files exist
+if not SEED_DIST.exists():
+    SEED_DIST.write_text("\n".join(DEFAULT_DIST_SEED + DEFAULT_DIST_SEED_DEV), encoding="utf-8")
+if not SEED_PS.exists():
+    SEED_PS.write_text("\n".join(DEFAULT_PS_SEED + DEFAULT_PS_SEED_DEV), encoding="utf-8")
+
+def load_seed_list(path: Path) -> List[str]:
+    try:
+        return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except:
+        return []
+
+# -------------------- Normalization helpers --------------------
 DEV_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
-
-def devanagari_to_ascii_digits(s: str) -> str:
-    return s.translate(DEV_DIGITS)
-
-def remove_control_chars(s: str) -> str:
-    return "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
-
-def strip_nonessential_unicode(s: str) -> str:
-    return re.sub(r"[^\x00-\x7F\u0900-\u097F\u2000-\u206F\u20B9\n\t:;.,/()\-—%₹]", " ", s)
-
-def collapse_spaces(s: str) -> str:
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"[ \t]*\n[ \t]*", "\n", s)
-    return s.strip()
-
-def fix_broken_devanagari_runs(s: str) -> str:
-    def once(x): return re.sub(r"([\u0900-\u097F])\s+([\u0900-\u097F])", r"\1\2", x)
-    prev = None; cur = s
-    for _ in range(6):
-        prev = cur; cur = once(cur)
-        if cur == prev: break
-    return cur
-
 def canonicalize_text(s: str) -> str:
     if not s: return ""
-    s = devanagari_to_ascii_digits(s)
-    s = remove_control_chars(s)
-    s = strip_nonessential_unicode(s)
-    s = collapse_spaces(s)
-    s = fix_broken_devanagari_runs(s)
+    s = s.translate(DEV_DIGITS)
+    s = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C")
+    s = re.sub(r"[^\x00-\x7F\u0900-\u097F\u2000-\u206F\u20B9\n\t:;.,/()\-—%₹]", " ", s)
+    s = re.sub(r"[ \t]+"," ", s)
+    s = re.sub(r"[ \t]*\n[ \t]*","\n", s).strip()
+    for _ in range(4):
+        s_new = re.sub(r"([\u0900-\u097F])\s+([\u0900-\u097F])", r"\1\2", s)
+        if s_new == s: break
+        s = s_new
     return s
 
-# ---------------------- PDF -> Text extraction ------------------------------
+# -------------------- PDF text extraction --------------------
 def extract_text_pymupdf(path: str) -> str:
     try:
         doc = fitz.open(path)
@@ -86,7 +72,7 @@ def extract_text_pymupdf(path: str) -> str:
 
 def extract_text_pdfplumber(path: str) -> str:
     try:
-        out = []
+        out=[]
         with pdfplumber.open(path) as pdf:
             for p in pdf.pages:
                 out.append(p.extract_text() or "")
@@ -94,43 +80,86 @@ def extract_text_pdfplumber(path: str) -> str:
     except Exception:
         return ""
 
-def extract_text_ocr(path: str, tesseract_langs: str = "eng+hin+mar") -> str:
+def extract_text_ocr(path: str, langs: str="eng+hin+mar") -> str:
     try:
         doc = fitz.open(path)
         out=[]
         for p in doc:
             pix = p.get_pixmap(matrix=fitz.Matrix(2,2))
-            img = Image.frombytes("RGB",[pix.width, pix.height], pix.samples)
-            out.append(pytesseract.image_to_string(img, lang=tesseract_langs))
+            img = Image.frombytes("RGB",[pix.width,pix.height], pix.samples)
+            out.append(pytesseract.image_to_string(img, lang=langs))
         return "\n".join(out)
     except Exception:
         return ""
 
-def extract_text_from_pdf(path: str, tesseract_langs: str="eng+hin+mar") -> str:
-    txt = extract_text_pymupdf(path)
-    txt = canonicalize_text(txt)
-    if len(txt) < 200:
-        alt = extract_text_pdfplumber(path); alt = canonicalize_text(alt)
-        if len(alt) > len(txt): txt = alt
-    if len(txt) < 200:
-        ocr = extract_text_ocr(path, tesseract_langs); ocr = canonicalize_text(ocr)
-        if len(ocr) > len(txt): txt = ocr
-    return canonicalize_text(txt)
+def extract_text_from_pdf_bytes(pdf_bytes: bytes, langs: str="eng+hin+mar") -> str:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes); tp = tmp.name
+    try:
+        txt = extract_text_pymupdf(tp)
+        txt = canonicalize_text(txt)
+        if len(txt) < 200:
+            alt = extract_text_pdfplumber(tp); alt = canonicalize_text(alt)
+            if len(alt) > len(txt): txt = alt
+        if len(txt) < 200:
+            ocr = extract_text_ocr(tp, langs); ocr = canonicalize_text(ocr)
+            if len(ocr) > len(txt): txt = ocr
+        return canonicalize_text(txt)
+    finally:
+        try: os.remove(tp)
+        except: pass
 
-# ---------------------- Candidate extractors (multilingual) -----------------
+# -------------------- Candidate collectors (multiple strategies) --------------------
 def find_year_candidates(text: str) -> List[str]:
     out=[]
     m = re.search(r"(?:Year|वर्ष|Date of FIR|Date)\s*[:\-]?\s*((?:19|20)\d{2})", text, re.IGNORECASE)
     if m: out.append(m.group(1))
-    m2 = re.search(r"\b(19|20)\d{2}\b", text)
-    if m2: out.append(m2.group(0))
+    for m in re.finditer(r"\b(19|20)\d{2}\b", text):
+        out.append(m.group(0))
     return list(dict.fromkeys(out))
+
+def find_section_candidates(text: str) -> List[str]:
+    secs=[]
+    for m in re.finditer(r"(?:धारा|कलम|Section|Sect|U/s|U/s\.)", text, re.IGNORECASE):
+        window = text[m.start(): m.start()+300]
+        nums = re.findall(r"\b\d{1,3}(?:\([^\)]*\))?\b", window)
+        for n in nums:
+            base = re.match(r"(\d{1,3})", n)
+            if base:
+                v = int(base.group(1))
+                if 1 <= v <= SECTION_MAX: secs.append(str(v))
+    if not secs:
+        for n in re.findall(r"\b\d{2,3}\b", text):
+            v = int(n)
+            if 10 <= v <= SECTION_MAX: secs.append(str(v))
+    return list(dict.fromkeys(secs))
+
+def find_acts(text: str) -> List[str]:
+    acts=[]
+    low = text.lower()
+    known = {
+        "ipc":"Indian Penal Code 1860",
+        "it act":"Information Technology Act 2000",
+        "information technology":"Information Technology Act 2000",
+        "arms act":"Arms Act 1959",
+        "crpc":"Code of Criminal Procedure 1973",
+        "pocso":"POCSO Act 2012"
+    }
+    for k,v in known.items():
+        if k in low and v not in acts: acts.append(v)
+    # capture "Act" chunks
+    for m in re.finditer(r"(?:Act|अधिनियम|कायदा)[^\n]{0,120}", text, re.IGNORECASE):
+        ch = m.group(0).strip()
+        for k,v in known.items():
+            if k in ch.lower() and v not in acts:
+                acts.append(v)
+    return acts
 
 def find_police_station_candidates(text: str) -> List[str]:
     out=[]
     patterns = [
-        r"(?:P\.S\.|P\.S|Police Station|पोलीस ठाणे|पुलिस थाना|थाना)\s*[:\-\)]?\s*([A-Za-z\u0900-\u097F0-9 .,-]{2,80})",
-        r"Name of P\.S\.?\s*[:\-]?\s*([A-Za-z\u0900-\u097F ]{2,80})"
+        r"(?:P\.S\.|Police Station|पोलीस ठाणे|पुलिस थाना|थाना)\s*[:\-\)]?\s*([A-Za-z\u0900-\u097F0-9 .,-]{2,120})",
+        r"Name of P\.S\.?\s*[:\-]?\s*([A-Za-z\u0900-\u097F ]{2,120})"
     ]
     for p in patterns:
         for m in re.finditer(p, text, re.IGNORECASE):
@@ -141,314 +170,339 @@ def find_police_station_candidates(text: str) -> List[str]:
 def find_district_candidates(text: str) -> List[str]:
     out=[]
     patterns = [
-        r"(?:District|Dist\.|जिला|जिल्हा|District Name)\s*[:\-\)]?\s*([A-Za-z\u0900-\u097F0-9 .,-]{2,80})",
-        r"District\s*\(?([A-Za-z\u0900-\u097F ]{2,80})\)?\s*\("
+        r"(?:District|Dist\.|जिला|जिल्हा|District Name)\s*[:\-\)]?\s*([A-Za-z\u0900-\u097F0-9 .,-]{2,120})",
+        r"District\s*\(?([A-Za-z\u0900-\u097F ]{2,80})\)?\s*[,\\)]"
     ]
     for p in patterns:
         for m in re.finditer(p, text, re.IGNORECASE):
-            out.append(m.group(1).strip())
+            v = m.group(1).strip()
+            if v: out.append(v)
     return list(dict.fromkeys(out))
-
-def find_acts_candidates(text: str) -> List[str]:
-    found=[]
-    low = text.lower()
-    for k, v in KNOWN_ACTS.items():
-        if k in low and v not in found:
-            found.append(v)
-    for m in re.finditer(r"(?:Act|अधिनियम|कायदा)[^\n]{0,120}", text, re.IGNORECASE):
-        chunk = m.group(0).lower()
-        for k,v in KNOWN_ACTS.items():
-            if k in chunk and v not in found:
-                found.append(v)
-    return list(dict.fromkeys(found))
-
-def find_section_candidates(text: str) -> List[str]:
-    secs=[]
-    for m in re.finditer(r"(?:Section|Sections|U\/s|U\/s\.|धारा|कलम|Sect)\b", text, re.IGNORECASE):
-        window = text[m.start(): m.start()+300]
-        nums = re.findall(r"\b\d{1,3}[A-Z]?(?:\([0-9A-Za-z]+\))?\b", window)
-        for n in nums:
-            base = re.match(r"(\d{1,3})", n)
-            if base:
-                try:
-                    v = int(base.group(1))
-                except:
-                    continue
-                if 1 <= v <= SECTION_MAX:
-                    secs.append(str(v))
-    if not secs:
-        nums = re.findall(r"\b\d{1,3}\b", text)
-        for n in nums:
-            v = int(n)
-            if v >= 10 and v <= SECTION_MAX:
-                secs.append(str(v))
-    return list(dict.fromkeys(secs))
 
 def find_name_candidates(text: str) -> List[str]:
     out=[]
     patterns = [
-        r"(?:Complainant|Informant|तक्रारदार|सूचक|Complainant\/Informant)[^\n]{0,80}[:\-]?\s*([A-Za-z\u0900-\u097F .]{2,160})",
-        r"(?:Name|नाव|नाम)\s*[:\-]?\s*([A-Za-z\u0900-\u097F .]{2,160})",
+        r"(?:Complainant|Informant|Complainant\/Informant|तक्रारदार|सूचक|अर्जदार)[^\n]{0,120}[:\-\)]?\s*([A-Za-z\u0900-\u097F .]{2,200})",
+        r"(?:Name|नाव|नाम)\s*[:\-\)]\s*([A-Za-z\u0900-\u097F .]{2,200})",
     ]
     for p in patterns:
         for m in re.finditer(p, text, re.IGNORECASE):
             v = m.group(1).strip(); out.append(v)
-    for m in re.finditer(r"\b([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20}){1,3})\b", text):
+    # fallback capitalized english names
+    for m in re.finditer(r"\b([A-Z][a-z]{1,25}(?:\s+[A-Z][a-z]{1,25}){1,3})\b", text):
         out.append(m.group(1).strip())
     return list(dict.fromkeys(out))
 
 def find_address_candidates(text: str) -> List[str]:
     out=[]
-    for m in re.finditer(r"(?:Address|पत्ता|Address\s*\(|पत्ता\s*\(|Address[:\-\)])\s*[:\-\)]?\s*([A-Za-z0-9\u0900-\u097F,./\- \n]{6,300})", text, re.IGNORECASE):
+    for m in re.finditer(r"(?:Address|पत्ता|Address\s*\(|पत्ता\s*\(|Address[:\-\)])\s*[:\-\)]?\s*([A-Za-z0-9\u0900-\u097F,./\-\n ]{8,300})", text, re.IGNORECASE):
         v = m.group(1).strip()
-        v = re.split(r"(?:Phone|Mobile|मोबाइल|मोबा|फोन|UID|Passport|Aadhar)", v, flags=re.IGNORECASE)[0].strip()
+        v = re.split(r"(?:Phone|Mobile|मोबाइल|मोबा|फोन|UID|Aadhar|Passport|PAN)", v, flags=re.IGNORECASE)[0].strip()
         out.append(" ".join(v.split()))
-    for m in re.finditer(r"[A-Za-z\u0900-\u097F0-9, .\-]{10,200}\b\d{6}\b", text):
-        out.append(m.group(0).strip())
+    # fallback: long run containing pin code
+    for m in re.finditer(r"([A-Za-z\u0900-\u097F0-9, .\-]{10,200}\b\d{6}\b)", text):
+        out.append(m.group(1).strip())
     return list(dict.fromkeys(out))
 
-# ---------------------- Fuzzy repair utilities -------------------------------
-def fuzzy_repair_to_list(candidate: str, choices: List[str], threshold: int = 70) -> str:
-    if not candidate or not choices:
-        return candidate
-    best = process.extractOne(candidate, choices, scorer=fuzz.WRatio)
-    if best and best[1] >= threshold:
-        return best[0]
+# -------------------- fuzzy repair & scoring --------------------
+def fuzzy_repair(candidate: Optional[str], seed_list: List[str], threshold:int=70) -> Optional[str]:
+    if not candidate: return None
+    if not seed_list: return candidate
+    best = process.extractOne(candidate, seed_list, scorer=fuzz.WRatio)
+    if best and best[1] >= threshold: return best[0]
     return candidate
 
-# ---------------------- Extraction orchestrator ------------------------------
-def extract_all_fields(text: str, district_seed, district_seed_dev, ps_seed, ps_seed_dev, debug: bool=False) -> Dict[str,Any]:
+def score_candidate(value: Optional[str], source: str) -> float:
+    if not value: return 0.0
+    base = 0.0
+    if source == "label": base += 0.6
+    if source == "fuzzy": base += 0.5
+    if source == "ner": base += 0.4
+    if source == "fallback": base += 0.2
+    # boost for length (not too short)
+    ln = len(value.strip())
+    base += min(ln, 100) / 200.0
+    # penalize if value is placeholder-like
+    if re.match(r"^(name|नाव|नाम|type|address)$", value.strip(), re.IGNORECASE): base *= 0.1
+    return round(base, 3)
+
+# -------------------- orchestrator: get candidates + scores --------------------
+def get_all_candidates(text: str, dist_seeds: List[str], ps_seeds: List[str]) -> Dict[str,List[Tuple[str,str,float]]]:
     t = canonicalize_text(text)
+    candidates = {}
 
-    # candidates
-    year_c = find_year_candidates(t)
-    ps_c = find_police_station_candidates(t)
+    # years
+    years = find_year_candidates(t)
+    candidates["year"] = [(y, "label", score_candidate(y, "label")) for y in years]
+
+    # district
     dist_c = find_district_candidates(t)
-    acts_c = find_acts_candidates(t)
-    sections_c = find_section_candidates(t)
-    name_c = find_name_candidates(t)
-    addr_c = find_address_candidates(t)
-
-    # fuzzy repair
-    district_rep = []
+    # add ner/loc fallback: we skip heavy NER for offline but keep placeholders
+    dist_entries=[]
     for d in dist_c:
-        rep = fuzzy_repair_to_list(d, district_seed + district_seed_dev)
-        district_rep.append(rep if rep else d)
-    ps_rep = []
+        repaired = fuzzy_repair(d, dist_seeds + dist_seeds)
+        src = "fuzzy" if repaired != d else "label"
+        dist_entries.append((repaired, src, score_candidate(repaired, src)))
+    candidates["dist_name"] = dist_entries
+
+    # police station
+    ps_c = find_police_station_candidates(t)
+    ps_entries=[]
     for p in ps_c:
-        rep = fuzzy_repair_to_list(p, ps_seed + ps_seed_dev)
-        ps_rep.append(rep if rep else p)
+        repaired = fuzzy_repair(p, ps_seeds + ps_seeds)
+        src = "fuzzy" if repaired != p else "label"
+        ps_entries.append((repaired, src, score_candidate(repaired, src)))
+    candidates["police_station"] = ps_entries
 
-    # choose best: simple heuristics (label > fuzzy > fallback)
-    def choose_best_label(items: List[str]) -> Optional[str]:
-        if not items: return None
-        return items[0].strip()
+    # acts and sections
+    acts = find_acts(t)
+    candidates["under_acts"] = [(a,"label",score_candidate(a,"label")) for a in acts]
+    secs = find_section_candidates(t)
+    candidates["under_sections"] = [(s,"label",score_candidate(s,"label")) for s in secs]
 
-    year_best = choose_best_label(year_c)
-    ps_best = choose_best_label(ps_rep or ps_c)
-    dist_best = choose_best_label(district_rep or dist_c)
-    name_best = choose_best_label(name_c)
-    addr_best = choose_best_label(addr_c)
+    # names
+    names = find_name_candidates(t)
+    candidates["name"] = [(n,"label",score_candidate(n,"label")) for n in names]
 
-    revised_case_category = "OTHER"
-    if acts_c and any("Information Technology" in a or "IT Act" in a for a in acts_c):
-        revised_case_category = "CYBER_CRIME"
-    if sections_c:
-        sset = set(sections_c)
-        if any(x in sset for x in ("354","376","509")):
-            revised_case_category = "SEXUAL_OFFENCE"
-        elif "302" in sset:
-            revised_case_category = "MURDER"
+    # addresses
+    addrs = find_address_candidates(t)
+    candidates["address"] = [(a,"label",score_candidate(a,"label")) for a in addrs]
 
-    # oparty heuristics
-    oparty = None
-    if re.search(r"\b(आरोपी|accused|प्रतिवादी)\b", t, re.IGNORECASE):
-        oparty = "Accused"
-    elif re.search(r"\b(तक्रारदार|complainant|informant|सूचक)\b", t, re.IGNORECASE):
-        oparty = "Complainant"
+    # oparty: simple detection
+    oparty = []
+    if re.search(r"\b(accused|आरोपी|प्रतिवादी)\b", t, re.IGNORECASE): oparty.append(("Accused","heuristic",0.8))
+    if re.search(r"\b(complainant|informant|तक्रारदार|सूचक)\b", t, re.IGNORECASE): oparty.append(("Complainant","heuristic",0.8))
+    candidates["oparty"] = oparty
 
-    jurisdiction = dist_best if dist_best else None
-    jurisdiction_type = "DISTRICT" if dist_best else None
+    # jurisdiction: prefer district
+    jurisdiction = []
+    if candidates.get("dist_name"):
+        for v,src,sc in candidates["dist_name"]:
+            jurisdiction.append((v,"derived",sc))
+    candidates["jurisdiction"] = jurisdiction
 
-    out = {
-        "year": year_best,
-        "state_name": None,
-        "dist_name": dist_best,
-        "police_station": ps_best,
-        "under_acts": acts_c if acts_c else None,
-        "under_sections": sections_c if sections_c else None,
-        "revised_case_category": revised_case_category,
-        "oparty": oparty,
-        "name": name_best,
-        "address": addr_best,
-        "jurisdiction": jurisdiction,
-        "jurisdiction_type": jurisdiction_type
-    }
+    return candidates
 
-    if debug:
-        out["_debug"] = {
-            "year_candidates": year_c,
-            "ps_candidates": ps_c,
-            "dist_candidates": dist_c,
-            "acts_candidates": acts_c,
-            "section_candidates": sections_c,
-            "name_candidates": name_c,
-            "address_candidates": addr_c
-        }
-    return out
+# -------------------- Streamlit UI: main ------------------------------------
+st.title("FIR PII Extractor — Human-in-the-loop tuning")
 
-# ---------------------- Streamlit UI ----------------------------------------
-st.title("FIR PII Extractor — Offline (Streamlit)")
+st.markdown("""
+Use this app to extract PII from FIRs, correct them quickly, and auto-update seeds (districts / police stations).
+Corrections are saved to `gold_labels.jsonl` and appended to seed files in `seeds/`.
+""")
 
-st.markdown(
-    """
-    Upload PDF(s) or point to a folder on the server (if deployed).  
-    The extractor will attempt text extraction (PyMuPDF → pdfplumber → Tesseract OCR) and return a JSON per file.
-    """
-)
-
-# Sidebar controls
+# sidebar
 with st.sidebar:
     st.header("Settings")
-    tesseract_langs = st.text_input("Tesseract languages", value="eng+hin+mar")
-    debug = st.checkbox("Show debug candidates", value=False)
-    st.markdown("You can upload a CSV (two columns) to extend district or police-station seeds.")
+    tesseract_langs = st.text_input("Tesseract langs", value="eng+hin+mar")
+    debug = st.checkbox("Show debug candidates", value=True)
+    st.markdown("You can also upload a CSV to PRE-POPULATE seeds (one entry per line).")
 
-# Seed CSV uploads (optional)
-st.subheader("Optional: Upload CSV to extend seeds")
-col1, col2 = st.columns(2)
-with col1:
-    dist_csv = st.file_uploader("Upload district CSV (one district per row)", type=["csv"], key="d_csv")
-with col2:
-    ps_csv = st.file_uploader("Upload police station CSV (one PS per row)", type=["csv"], key="ps_csv")
+# allow user to upload seed CSVs optionally
+seed_dist_upload = st.file_uploader("Upload district seed CSV (optional)", type=["csv","txt"])
+seed_ps_upload = st.file_uploader("Upload PS seed CSV (optional)", type=["csv","txt"])
 
-# Build seeds
-district_seed = list(DEFAULT_DISTRICT_SEED)
-district_seed_dev = list(DEFAULT_DISTRICT_SEED_DEV)
-ps_seed = list(DEFAULT_PS_SEED)
-ps_seed_dev = list(DEFAULT_PS_SEED_DEV)
+# build seed lists (start from files)
+dist_seeds = load_seed_list(SEED_DIST)
+ps_seeds = load_seed_list(SEED_PS)
 
-def load_csv_to_list(uploaded_file) -> List[str]:
-    if not uploaded_file:
-        return []
+def read_seed_upload(f) -> List[str]:
     try:
-        raw = uploaded_file.read().decode(errors="ignore").splitlines()
-        rows = [r.strip().strip('"').strip("'") for r in raw if r.strip()]
-        return rows
-    except Exception:
+        text = f.read().decode(errors="ignore")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        return lines
+    except:
         return []
 
-if dist_csv:
-    new_d = load_csv_to_list(dist_csv)
-    district_seed = new_d + district_seed
-if ps_csv:
-    new_ps = load_csv_to_list(ps_csv)
-    ps_seed = new_ps + ps_seed
+if seed_dist_upload:
+    dist_seeds = read_seed_upload(seed_dist_upload) + dist_seeds
+if seed_ps_upload:
+    ps_seeds = read_seed_upload(seed_ps_upload) + ps_seeds
 
-# Input: uploaded files OR server folder
-st.subheader("Input PDFs")
-mode = st.radio("Choose input mode", options=["Upload PDFs (recommended for testing)","Server folder (for bulk on deployed server)"], index=0)
+# input mode
+mode = st.radio("Input mode", ["Upload PDFs", "Folder on server (path)"], index=0)
+uploaded = st.file_uploader("Upload PDF(s)", type=["pdf"], accept_multiple_files=True) if mode=="Upload PDFs" else None
+server_folder = st.text_input("Server folder path (absolute)") if mode!="Upload PDFs" else None
 
-uploaded_files = []
-server_folder_path = None
-if mode.startswith("Upload"):
-    uploaded_files = st.file_uploader("Upload one or more PDFs", type=["pdf"], accept_multiple_files=True)
-else:
-    server_folder_path = st.text_input("Enter absolute path to folder with PDFs on server (example: /home/appuser/app/pdfs)")
-    st.caption("When deployed on Streamlit Cloud, you can place PDFs in your repo and use the repo path here.")
+run_btn = st.button("Run extraction and open reviewer")
 
-# Action button
-run_btn = st.button("Run extraction")
+# results state in session
+if "queue" not in st.session_state:
+    st.session_state.queue = []  # list of tuples (filename, pdf_bytes, extracted_candidates, finalized_result or None)
 
-# Results containers
-results_container = st.container()
-download_container = st.container()
-
-# Processing
+# load queue
 if run_btn:
-    files_to_process: List[Tuple[str, bytes]] = []
-
-    if mode.startswith("Upload"):
-        if not uploaded_files:
-            st.warning("Please upload at least one PDF.")
+    # clear existing
+    st.session_state.queue = []
+    files = []
+    if mode=="Upload PDFs":
+        if not uploaded:
+            st.warning("Upload PDFs first.")
             st.stop()
-        for f in uploaded_files:
-            # read to memory
-            files_to_process.append((f.name, f.read()))
+        files = [(f.name, f.read()) for f in uploaded]
     else:
-        if not server_folder_path:
-            st.warning("Please enter server folder path")
+        if not server_folder:
+            st.warning("enter server folder")
             st.stop()
-        p = Path(server_folder_path)
-        if not p.exists() or not p.is_dir():
-            st.warning("Server folder path does not exist on the server.")
-            st.stop()
-        # gather PDF file paths
+        p = Path(server_folder)
+        if not p.exists(): st.warning("folder not found"); st.stop()
         for fp in sorted(p.glob("*.pdf")):
-            # read file bytes
-            with open(fp, "rb") as fh:
-                files_to_process.append((fp.name, fh.read()))
+            with open(fp,"rb") as fh:
+                files.append((fp.name, fh.read()))
 
-    total = len(files_to_process)
-    st.info(f"Processing {total} file(s). This may take time if OCR kicks in.")
+    # enqueue with extracted candidates
+    for fname, data in files:
+        text = extract_text_from_pdf_bytes(data, langs=tesseract_langs)
+        candidates = get_all_candidates(text, dist_seeds, ps_seeds)
+        # build initial best-guesses (highest score candidate)
+        def top(cands):
+            return cands[0][0] if cands else None
+        initial = {
+            "year": top(candidates.get("year",[])),
+            "state_name": None,
+            "dist_name": top(candidates.get("dist_name",[])),
+            "police_station": top(candidates.get("police_station",[])),
+            "under_acts": [v for v,_,_ in candidates.get("under_acts",[])],
+            "under_sections": [v for v,_,_ in candidates.get("under_sections",[])],
+            "revised_case_category": None,
+            "oparty": top(candidates.get("oparty",[])),
+            "name": top(candidates.get("name",[])),
+            "address": top(candidates.get("address",[])),
+            "jurisdiction": top(candidates.get("jurisdiction",[])),
+            "jurisdiction_type": "DISTRICT" if top(candidates.get("dist_name",[])) else None
+        }
+        st.session_state.queue.append((fname, data, text, candidates, initial, None))
 
-    results = {}
-    progress = st.progress(0)
-    i = 0
+st.markdown("---")
 
-    # temporary directory to store per-file JSONs for zipping
-    tmpdir = tempfile.mkdtemp()
-    for name, data in files_to_process:
-        i += 1
-        progress.progress(int(i/total * 100))
-        st.text(f"Processing: {name} ({i}/{total})")
-        # write bytes to temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(data); tmp_path = tmp.name
-        try:
-            # extract text with configured languages
-            text = extract_text_from_pdf(tmp_path, tesseract_langs=tesseract_langs)
-            # if extracted text too short, try OCR with stronger fallback
-            if len(text) < 60:
-                # try OCR explicitly
-                text = extract_text_ocr(tmp_path, tesseract_langs)
+# Reviewer area: show one doc at a time with navigation
+if st.session_state.queue:
+    idx = st.number_input("Document index", min_value=0, max_value=max(0,len(st.session_state.queue)-1), value=0, step=1)
+    fname, pdf_bytes, text, candidates, initial, finalized = st.session_state.queue[idx]
 
-            # run extractor
-            out = extract_all_fields(text, district_seed, district_seed_dev, ps_seed, ps_seed_dev, debug=debug)
-            results[name] = out
+    st.header(f"Review: {fname}  (doc {idx+1} of {len(st.session_state.queue)})")
+    col1, col2 = st.columns([2,1])
+    with col1:
+        st.subheader("Raw extracted text (snippet)")
+        st.code(text[:4000])
+    with col2:
+        st.subheader("Quick stats")
+        st.write(f"Candidates found — year: {len(candidates.get('year',[]))}, dist: {len(candidates.get('dist_name',[]))}, ps: {len(candidates.get('police_station',[]))}, names: {len(candidates.get('name',[]))}")
 
-            # write per-file JSON in tmpdir
-            outpath = os.path.join(tmpdir, f"{name}.json")
-            with open(outpath, "w", encoding="utf-8") as wf:
-                json.dump(out, wf, ensure_ascii=False, indent=2)
+    st.markdown("### Suggested field values — pick or edit (helps train the system)")
+    # helper to render dropdowns with candidates
+    def render_field(field_name, cand_list, initial_val):
+        st.write(f"**{field_name}**")
+        options = ["(empty)"]
+        # include unique candidates preserving order
+        opts = []
+        for v,src,sc in cand_list:
+            if v and v not in opts: opts.append(v)
+        options += opts
+        # place initial value first if not in list
+        if initial_val and initial_val not in options:
+            options = [initial_val] + options
+        sel = st.selectbox(f"Choose {field_name} value", options=options, index=0, key=f"{idx}_{field_name}_sel")
+        # allow free text edit
+        txt = st.text_input(f"Edit {field_name} (final)", value=sel if sel!="(empty)" else "", key=f"{idx}_{field_name}_txt")
+        # compute confidence (max candidate score or low if empty)
+        max_score = max((sc for _,_,sc in cand_list), default=0.0)
+        st.caption(f"candidate_count={len(cand_list)}  top_score={max_score}")
+        return txt.strip() if txt.strip()!="" else None
 
-            # show per-file result in UI (collapsible)
-            with results_container:
-                st.markdown(f"**{name}**")
-                st.json(out)
-                if debug and "_debug" in out:
-                    st.markdown("**Debug candidates**")
-                    st.json(out["_debug"])
-        except Exception as e:
-            st.error(f"Error processing {name}: {e}")
-            results[name] = {"error": str(e)}
-        finally:
-            try: os.remove(tmp_path)
-            except: pass
+    # render fields
+    year_val = render_field("year", candidates.get("year",[]), initial.get("year"))
+    dist_val = render_field("dist_name", candidates.get("dist_name",[]), initial.get("dist_name"))
+    ps_val = render_field("police_station", candidates.get("police_station",[]), initial.get("police_station"))
+    name_val = render_field("name", candidates.get("name",[]), initial.get("name"))
+    addr_val = render_field("address", candidates.get("address",[]), initial.get("address"))
 
-    progress.progress(100)
-    st.success(f"Processed {total} files.")
+    # sections and acts: show lists and allow edit
+    st.write("**under_sections** (choose multiple / edit as comma-separated)**")
+    secs_opts = [v for v,_,_ in candidates.get("under_sections",[])]
+    secs_default = ",".join(secs_opts) if secs_opts else ",".join(initial.get("under_sections") or [])
+    secs_free = st.text_input("Edit sections (comma separated)", value=secs_default, key=f"{idx}_sections")
+    sections_final = [s.strip() for s in secs_free.split(",") if s.strip()]
 
-    # prepare downloadable ZIP of all JSON outputs
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname in os.listdir(tmpdir):
-            zf.write(os.path.join(tmpdir, fname), arcname=fname)
-    zip_buffer.seek(0)
+    st.write("**under_acts** (list)**")
+    acts_opts = [v for v,_,_ in candidates.get("under_acts",[])]
+    acts_default = ",".join(acts_opts) if acts_opts else ",".join(initial.get("under_acts") or [])
+    acts_free = st.text_input("Edit acts (comma separated)", value=acts_default, key=f"{idx}_acts")
+    acts_final = [a.strip() for a in acts_free.split(",") if a.strip()]
 
-    with download_container:
-        st.download_button("Download all JSONs (zip)", data=zip_buffer.getvalue(), file_name="pii_extraction_results.zip")
-        st.download_button("Download combined JSON", data=json.dumps(results, ensure_ascii=False, indent=2), file_name="combined_results.json")
+    # oparty
+    oparty_opts = [v for v,_,_ in candidates.get("oparty",[])]
+    oparty_sel = st.selectbox("oparty (if known)", options=["(unknown)"] + oparty_opts, index=0, key=f"{idx}_oparty")
+    oparty_val = None if oparty_sel=="(unknown)" else oparty_sel
 
-    st.info("Tip: use Debug mode to see candidates and extend the seed CSVs to improve fuzzy repairing.")
+    # final action buttons
+    st.markdown("### Actions")
+    cola, colb, colc = st.columns(3)
+    with cola:
+        if st.button("Save correction / Accept", key=f"{idx}_save"):
+            # build final dict
+            final = {
+                "file": fname,
+                "year": year_val,
+                "state_name": None,
+                "dist_name": dist_val,
+                "police_station": ps_val,
+                "under_acts": acts_final or None,
+                "under_sections": sections_final or None,
+                "revised_case_category": None,
+                "oparty": oparty_val,
+                "name": name_val,
+                "address": addr_val,
+                "jurisdiction": dist_val or None,
+                "jurisdiction_type": "DISTRICT" if dist_val else None
+            }
+            # append to gold file
+            try:
+                with GOLD_FILE.open("a", encoding="utf-8") as gf:
+                    gf.write(json.dumps(final, ensure_ascii=False) + "\n")
+                st.success("Saved to gold_labels.jsonl")
+            except Exception as e:
+                st.error(f"Failed to save gold label: {e}")
 
+            # auto-append new seeds (if present and not already included)
+            updated = False
+            if dist_val:
+                ds = load_seed_list(SEED_DIST)
+                if dist_val not in ds:
+                    ds.append(dist_val); SEED_DIST.write_text("\n".join(ds), encoding="utf-8"); updated=True
+            if ps_val:
+                ps = load_seed_list(SEED_PS)
+                if ps_val not in ps:
+                    ps.append(ps_val); SEED_PS.write_text("\n".join(ps), encoding="utf-8"); updated=True
+            if updated:
+                st.info("Updated seed files with your corrections (districts / police_stations).")
+
+            # store finalized result in session queue
+            st.session_state.queue[idx] = (fname, pdf_bytes, text, candidates, initial, final)
+    with colb:
+        if st.button("Mark as SKIP (no change)", key=f"{idx}_skip"):
+            st.info("Skipped (no gold label saved).")
+            st.session_state.queue[idx] = (fname, pdf_bytes, text, candidates, initial, None)
+    with colc:
+        if st.button("Mark as BAD (needs full manual review)", key=f"{idx}_bad"):
+            st.warning("Marked BAD — saved to gold with error flag")
+            final = {"file": fname, "error": "BAD_DOCUMENT"}
+            with GOLD_FILE.open("a", encoding="utf-8") as gf: gf.write(json.dumps(final, ensure_ascii=False) + "\n")
+            st.session_state.queue[idx] = (fname, pdf_bytes, text, candidates, initial, final)
+
+    st.markdown("---")
+    st.write("Navigation: change Document index at top to move through queue")
+
+    # export seeds / gold
+    st.markdown("### Export / Utilities")
+    if st.button("Download current seeds (districts + ps)"):
+        z = {"districts": load_seed_list(SEED_DIST), "police_stations": load_seed_list(SEED_PS)}
+        st.download_button("Download seeds JSON", json.dumps(z, ensure_ascii=False, indent=2), file_name="seeds_export.json")
+    if GOLD_FILE.exists():
+        if st.button("Download gold labels (jsonl)"):
+            st.download_button("Download gold labels", GOLD_FILE.read_text(encoding="utf-8"), file_name="gold_labels.jsonl")
+
+else:
+    st.info("No documents in queue. Upload PDFs or point to a server folder and click 'Run extraction and open reviewer'.")
+
+# -------------------- end of file --------------------
