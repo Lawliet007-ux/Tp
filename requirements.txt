@@ -1,9 +1,11 @@
-pymupdf 
+streamlit 
 pdfplumber 
+pymupdf 
 pytesseract 
 pillow 
-rapidfuzz 
-transformers 
-torch 
-tqdm 
-pandas
+stanza 
+sentence-transformers 
+numpy 
+scikit-learn 
+opencv-python-headless 
+nltk
