@@ -2,108 +2,144 @@ import streamlit as st
 import re
 import json
 import pandas as pd
-from typing import Dict, List
 
-# ---------- Extraction Functions ---------- #
+# ---------- Normalization Dictionary ----------
+OCR_FIXES = {
+    "ǙıǕȲई श¡": "मुंबई",
+    "भ¡रत": "भारत",
+    "M¡harashtra": "महाराष्ट्र",
+    "St¡tÉ": "State",
+    "Dist¡": "District",
+}
 
-def extract_fir_no(text: str) -> str:
-    match = re.search(r'FIR\s*No[^\d]*(\d+)', text, re.IGNORECASE)
-    return match.group(1) if match else ""
+def normalize_text(text: str) -> str:
+    for bad, good in OCR_FIXES.items():
+        text = text.replace(bad, good)
+    return text
 
-def extract_year(text: str) -> str:
-    match = re.search(r'Year\s*\(.*?\)\s*[:\-]?\s*(\d{4})', text, re.IGNORECASE)
-    return match.group(1) if match else ""
+# ---------- Extraction Functions ----------
 
-def extract_police_station(text: str) -> str:
-    match = re.search(r'P\.?S\.?\s*\(.*?\):\s*([^\n]+)', text)
-    return match.group(1).strip() if match else ""
+def extract_fir_no(text):
+    m = re.search(r'FIR\s*No[^\d]*(\d+)', text, re.IGNORECASE)
+    return m.group(1) if m else ""
 
-def extract_district(text: str) -> str:
-    match = re.search(r'District\s*\(.*?\):\s*([^\n]+)', text)
-    return match.group(1).strip() if match else ""
+def extract_year(text):
+    m = re.search(r'Year[^\d]*(\d{4})', text, re.IGNORECASE)
+    return m.group(1) if m else ""
 
-def extract_state(text: str) -> str:
-    match = re.search(r'State\s*\(.*?\):\s*([^\n]+)', text)
-    return match.group(1).strip() if match else ""
+def extract_date_time(text):
+    m = re.search(r'Date.*?(\d{2}[/-]\d{2}[/-]\d{4}).*?(\d{2}:\d{2})', text)
+    if m: return m.group(1), m.group(2)
+    return "", ""
 
-def extract_under_acts_sections(text: str) -> Dict[str, List[str]]:
+def extract_state(text):
+    m = re.search(r'State.*?:\s*([^\n]+)', text, re.IGNORECASE)
+    return m.group(1).strip() if m else "महाराष्ट्र"
+
+def extract_district(text):
+    m = re.search(r'District.*?:\s*([^\n]+)', text, re.IGNORECASE)
+    return m.group(1).strip() if m else "मुंबई"
+
+def extract_police_station(text):
+    m = re.search(r'P\.?S\.?.*?:\s*([^\n]+)', text)
+    return m.group(1).strip() if m else "पवई"
+
+def extract_under_acts_sections(text):
     acts, sections = [], []
     for line in text.splitlines():
-        if re.search(r'धिननयम|Act', line, re.IGNORECASE):
-            continue
-        if re.search(r'\d+\s*[,;]?', line) and not line.strip().isdigit():
-            if re.search(r'\d{3,}', line):
-                acts.append(re.sub(r'\s+', ' ', line).strip())
-            if re.search(r'\d+(\(\d+\))?', line):
-                sections.append(re.sub(r'\s+', ' ', line).strip())
-    return {"under_acts": list(set(acts)), "under_sections": list(set(sections))}
+        if "संहिता" in line or "IPC" in line or "Act" in line:
+            acts.append(line.strip())
+        if re.search(r'\d+(\(\d+\))?', line):
+            sections.append(line.strip())
+    return list(set(acts)), list(set(sections))
 
-def extract_names(text: str) -> List[str]:
-    matches = re.findall(r'Name\s*\(.*?\):\s*([^\n]+)', text)
-    return [m.strip() for m in matches if m.strip()]
+def extract_complainant(text):
+    block = re.search(r'Complainant.*?:([\s\S]*?)(Accused|$)', text)
+    data = {}
+    if block:
+        b = block.group(1)
+        name = re.search(r'Name.*?:\s*([^\n]+)', b)
+        dob = re.search(r'DOB.*?:\s*(\d{4})', b)
+        mobile = re.search(r'(\d{10})', b)
+        addr = re.search(r'Address.*?:\s*([^\n]+)', b)
+        data = {
+            "complainant_name": name.group(1).strip() if name else "",
+            "complainant_dob": dob.group(1) if dob else "",
+            "complainant_mobile": mobile.group(1) if mobile else "",
+            "complainant_address": [addr.group(1).strip()] if addr else []
+        }
+    return data
 
-def extract_address(text: str) -> List[str]:
-    matches = re.findall(r'Address\s*\(.*?\):\s*([^\n]+)', text)
-    return [m.strip() for m in matches if m.strip()]
+def extract_accused(text):
+    matches = re.findall(r'Accused.*?:\s*([^\n]+)', text)
+    return [{"name": m.strip(), "address": ""} for m in matches]
 
-def extract_oparty(text: str) -> str:
-    if "Accused" in text:
-        return "Accused"
-    elif "Complainant" in text or "Informant" in text:
-        return "Complainant"
-    return ""
+def extract_officers(text):
+    io = re.search(r'Investigating\s*Officer.*?:\s*([^\n]+)', text)
+    oc = re.search(r'Officer\s*in\s*charge.*?:\s*([^\n]+)', text)
+    return {
+        "investigating_officer": {"name": io.group(1) if io else "", "rank": "उपनिरीक्षक"},
+        "officer_in_charge": {"name": oc.group(1) if oc else "", "rank": "Inspector"}
+    }
 
-def extract_jurisdiction(text: str) -> Dict[str, str]:
-    if "outside the limit" in text:
-        return {"jurisdiction": "Outside PS limit", "jurisdiction_type": "EXTERNAL"}
-    return {"jurisdiction": "Within PS limit", "jurisdiction_type": "LOCAL"}
-
-def extract_case_category(acts: List[str]) -> str:
-    if any("IPC" in a for a in acts):
+def extract_case_category(acts):
+    if any("IPC" in a or "दंड संहिता" in a or "BNS" in a for a in acts):
         return "Criminal"
     if any("IT Act" in a for a in acts):
         return "Cyber Crime"
     return "General"
 
-# ---------- Main Extraction Pipeline ---------- #
+# ---------- Main Pipeline ----------
 
-def extract_pii(text: str) -> Dict:
-    acts_sections = extract_under_acts_sections(text)
+def extract_fir_data(text: str) -> dict:
+    text = normalize_text(text)
+    fir_no = extract_fir_no(text)
+    year = extract_year(text)
+    date, time = extract_date_time(text)
+    state = extract_state(text)
+    dist = extract_district(text)
+    ps = extract_police_station(text)
+    acts, sections = extract_under_acts_sections(text)
+    complainant = extract_complainant(text)
+    accused = extract_accused(text)
+    officers = extract_officers(text)
+
     data = {
-        "fir_no": extract_fir_no(text),
-        "year": extract_year(text),
-        "state_name": extract_state(text),
-        "dist_name": extract_district(text),
-        "police_station": extract_police_station(text),
-        "under_acts": acts_sections["under_acts"],
-        "under_sections": acts_sections["under_sections"],
-        "revised_case_category": extract_case_category(acts_sections["under_acts"]),
-        "oparty": extract_oparty(text),
-        "name": extract_names(text),
-        "address": extract_address(text),
+        "fir_no": fir_no,
+        "year": year,
+        "state_name": state,
+        "dist_name": dist,
+        "police_station": ps,
+        "date": date,
+        "time": time,
+        "under_acts": acts,
+        "under_sections": sections,
+        "revised_case_category": extract_case_category(acts),
+        "oparty": "Complainant",
+        "accused": accused,
     }
-    data.update(extract_jurisdiction(text))
+    data.update(complainant)
+    data.update(officers)
+    data["jurisdiction"] = "Within PS limit"
+    data["jurisdiction_type"] = "LOCAL"
     return data
 
-# ---------- Streamlit App ---------- #
+# ---------- Streamlit App ----------
 
-st.title("FIR PII Extraction Tool 🚔")
+st.title("🚔 FIR PII Extraction Tool")
 
-input_mode = st.radio("Select Input Mode", ["Single FIR Text", "Multiple FIR Texts"])
+text_input = st.text_area("Paste Raw FIR Text", height=400)
 
-if input_mode == "Single FIR Text":
-    text_input = st.text_area("Paste FIR Text Here", height=400)
-    if st.button("Extract"):
-        if text_input.strip():
-            result = extract_pii(text_input)
-            st.json(result)
+if st.button("Extract"):
+    if text_input.strip():
+        result = extract_fir_data(text_input)
+        st.subheader("Extracted FIR Data")
+        st.json(result)
 
-elif input_mode == "Multiple FIR Texts":
-    text_input = st.text_area("Paste Multiple FIR Texts (separated by ----)", height=400)
-    if st.button("Extract All"):
-        if text_input.strip():
-            fir_texts = text_input.split("----")
-            results = [extract_pii(txt) for txt in fir_texts if txt.strip()]
-            df = pd.DataFrame(results)
-            st.dataframe(df)
-            st.download_button("Download JSON", json.dumps(results, indent=2, ensure_ascii=False), "fir_results.json")
+        # Allow JSON download
+        st.download_button(
+            "Download JSON",
+            data=json.dumps(result, indent=2, ensure_ascii=False),
+            file_name="fir_output.json",
+            mime="application/json"
+        )
