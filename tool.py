@@ -1,486 +1,259 @@
 """
-Streamlit FIR PII Extractor (Hybrid — layout + OCR + semantic search + neural NER)
+FIR PII Extractor (Hybrid OCR + NER + Semantic)
 
 Features:
-- Upload a PDF (scanned or digital), handles English + Hindi primarily.
-- Attempts text extraction using: pdfplumber -> PyMuPDF (fitz) -> OCR (pytesseract on rendered pages).
-- Uses sentence-transformers to semantically locate sentences likely containing each target field.
-- Uses Stanza (neural multilingual pipeline) for NER (Hindi + English).
-- Avoids regex-based brittle parsing; uses token scanning and neural methods + semantic search.
-- Outputs structured JSON with confidence scores and allows download.
-
-Notes:
-- This is a heavy pipeline (models will download on first run: stanza models and sentence-transformers).
-- Install Tesseract on your machine and Hindi traineddata for best OCR: (Ubuntu example below).
-
-Ubuntu quick setup (run in terminal):
-# system deps
-sudo apt update && sudo apt install -y tesseract-ocr tesseract-ocr-hin poppler-utils
-# python deps
-python -m pip install --upgrade pip
-pip install streamlit pdfplumber pymupdf pytesseract pillow stanza sentence-transformers numpy scikit-learn opencv-python-headless nltk
-
-Run the app:
-streamlit run streamlit_fir_extractor.py
-
+- Extracts PII fields from FIR PDFs (Hindi/English).
+- Handles CID-encoded PDFs (OCR fallback).
+- Supports 3 OCR backends: Tesseract (default), Google Vision, AWS Textract.
+- Uses Stanza (NER) + sentence-transformers for semantic candidate search.
 """
 
 import streamlit as st
 import io
 import json
-import tempfile
-from typing import List, Dict, Any, Tuple
-
-# PDF/text/image tools
-import pdfplumber
 import fitz  # PyMuPDF
+import pdfplumber
 from PIL import Image
 import pytesseract
-import cv2
 import numpy as np
+import cv2
+import os
+import re
+from typing import Dict, Any, List, Tuple
 
 # NLP
 import stanza
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import nltk
+nltk.download("punkt")
 
-nltk.download('punkt')
+# Optional: Google & AWS clients
+try:
+    from google.cloud import vision
+except ImportError:
+    vision = None
+
+try:
+    import boto3
+except ImportError:
+    boto3 = None
+
 
 # -------------------------
-# Initialization helpers
+# Init models
 # -------------------------
 @st.cache_resource
-def init_sentence_transformer(model_name: str = 'all-MiniLM-L6-v2') -> SentenceTransformer:
-    return SentenceTransformer(model_name)
+def init_stanza():
+    stanza.download("en", processors="tokenize,ner")
+    stanza.download("hi", processors="tokenize,ner")
+    return {
+        "en": stanza.Pipeline(lang="en", processors="tokenize,ner", use_gpu=False, verbose=False),
+        "hi": stanza.Pipeline(lang="hi", processors="tokenize,ner", use_gpu=False, verbose=False),
+    }
 
 @st.cache_resource
-def init_stanza_pipelines() -> Dict[str, Any]:
-    # download models if needed (first run will download)
-    try:
-        stanza.download('en', processors='tokenize,ner')
-    except Exception:
-        pass
-    try:
-        stanza.download('hi', processors='tokenize,ner')
-    except Exception:
-        pass
+def init_st_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-    en = stanza.Pipeline(lang='en', processors='tokenize,ner', use_gpu=False, verbose=False)
-    hi = stanza.Pipeline(lang='hi', processors='tokenize,ner', use_gpu=False, verbose=False)
-    return {'en': en, 'hi': hi}
 
 # -------------------------
-# Text extraction
+# OCR Backends
 # -------------------------
+def ocr_tesseract(pil_img: Image.Image, lang="hin+eng") -> str:
+    img = np.array(pil_img)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    gray = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 15, 11)
+    pil_for_ocr = Image.fromarray(th)
+    return pytesseract.image_to_string(pil_for_ocr, lang=lang)
 
-def extract_text_pdf_bytes(file_bytes: bytes) -> Tuple[str, List[Image.Image]]:
-    """Return extracted text and a list of page images (PIL.Image).
-    Strategy:
-      1) Try pdfplumber text extraction (best for digital PDFs).
-      2) If text content is short, render pages via fitz and run OCR.
-      3) Provide list of page images so the UI can show / OCR can use them.
-    """
+
+def ocr_google(pil_img: Image.Image) -> str:
+    if vision is None:
+        raise RuntimeError("Google Vision not installed")
+    client = vision.ImageAnnotatorClient()
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    content = buf.getvalue()
+    image = vision.Image(content=content)
+    response = client.text_detection(image=image)
+    texts = [t.description for t in response.text_annotations]
+    return texts[0] if texts else ""
+
+
+def ocr_aws(pil_img: Image.Image) -> str:
+    if boto3 is None:
+        raise RuntimeError("boto3 not installed")
+    client = boto3.client("textract")
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    content = buf.getvalue()
+    resp = client.detect_document_text(Document={"Bytes": content})
+    texts = [b["Text"] for b in resp["Blocks"] if b["BlockType"] == "LINE"]
+    return "\n".join(texts)
+
+
+def ocr_image(pil_img: Image.Image, backend="tesseract") -> str:
+    if backend == "google":
+        return ocr_google(pil_img)
+    elif backend == "aws":
+        return ocr_aws(pil_img)
+    else:
+        return ocr_tesseract(pil_img)
+
+
+# -------------------------
+# PDF Extraction
+# -------------------------
+def extract_text_pdf(file_bytes: bytes, ocr_backend="tesseract") -> Tuple[str, List[Image.Image]]:
+    page_images = []
     text_accum = []
-    page_images: List[Image.Image] = []
 
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for p in pdf.pages:
-            try:
-                text = p.extract_text() or ""
-            except Exception:
-                text = ""
-            if text:
-                text_accum.append(text)
-
-    # Render pages with fitz to images (for OCR and fallbacks)
-    doc = fitz.open(stream=file_bytes, filetype='pdf')
+    # Render PDF pages
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
     for i in range(len(doc)):
         page = doc.load_page(i)
-        mat = fitz.Matrix(2, 2)  # render at higher resolution
+        mat = fitz.Matrix(3, 3)  # 300 dpi
         pix = page.get_pixmap(matrix=mat, alpha=False)
         mode = "RGB" if pix.n < 4 else "RGBA"
         img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
         page_images.append(img)
 
+    # Extract text via pdfplumber
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for p in pdf.pages:
+            try:
+                txt = p.extract_text() or ""
+            except Exception:
+                txt = ""
+            if txt:
+                text_accum.append(txt)
+
     text = "\n".join(text_accum)
 
-    # if extracted text is very short (likely scanned PDF) -> OCR the images
-    if len(text.strip()) < 200:
-        ocr_texts = []
-        for img in page_images:
-            ocr_texts.append(ocr_image(img))
+    # OCR fallback if short text or CID corruption
+    if len(text.strip()) < 300 or "(cid:" in text:
+        ocr_texts = [ocr_image(img, backend=ocr_backend) for img in page_images]
         text = "\n".join(ocr_texts)
 
     return text, page_images
 
 
-def ocr_image(pil_img: Image.Image, lang: str = 'eng+hin') -> str:
-    """Preprocess and OCR a PIL image using pytesseract."""
-    # convert to OpenCV image
-    img = np.array(pil_img)
-    if img.ndim == 3 and img.shape[2] == 4:
-        img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-    if img.ndim == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = img
-
-    # basic denoising and adaptive thresholding
-    gray = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-    # use adaptive thresholding to increase text contrast
-    try:
-        th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 15, 11)
-    except Exception:
-        th = gray
-
-    # run pytesseract
-    pil_for_ocr = Image.fromarray(th)
-    try:
-        text = pytesseract.image_to_string(pil_for_ocr, lang=lang)
-    except Exception:
-        # fallback to English only
-        text = pytesseract.image_to_string(pil_for_ocr, lang='eng')
-
-    return text
-
 # -------------------------
-# Semantic search + field prompts
+# PII Extraction Helpers
 # -------------------------
-FIELD_PROMPTS = {
-    'fir_no': [
-        "FIR number",
-        "F.I.R. number",
-        "FIR No",
-        "First information report number",
-        "एफआईआर नंबर",
-        "FIR संख्या",
-    ],
-    'year': [
-        "Year of FIR",
-        "Year",
-        "Date and year",
-        "वर्ष",
-    ],
-    'state_name': [
-        "State",
-        "State name",
-        "राज्य",
-    ],
-    'dist_name': [
-        "District",
-        "District name",
-        "जिला",
-    ],
-    'police_station': [
-        "Police station",
-        "Thana",
-        " थाना ",
-    ],
-    'under_acts': [
-        "Acts under which case is registered",
-        "Act",
-        "अधिनियम",
-        "IPC",
-    ],
-    'under_sections': [
-        "Sections",
-        "Under sections",
-        "धारा",
-    ],
-    'revised_case_category': [
-        "Case category",
-        "Offence category",
-        "revised case category",
-    ],
-    'oparty': [
-        "Opposite party",
-        "Complainant",
-        "Plaintiff",
-        "पक्ष",
-    ],
-    'accused_name': [
-        "Accused",
-        "Accused name",
-        "अभियुक्त",
-        "विंशेष व्यक्ति",
-    ],
-    'address': [
-        "Address",
-        "Address of accused",
-        "पता",
-    ],
-    'jurisdiction': [
-        "Jurisdiction",
-        "Court jurisdiction",
-        "क्षेत्र",
-    ],
-}
+FIELDS = ["fir_no", "year", "state_name", "dist_name", "police_station",
+          "under_acts", "under_sections", "revised_case_category",
+          "oparty", "accused_name", "address", "jurisdiction"]
 
-JURISDICTION_TYPES = [
-    'PAN_INDIA', 'STATE', 'DISTRICT', 'SPECIAL', 'UNKNOWN'
-]
-
-@st.cache_resource
-def build_prompt_embeddings(model_name: str = 'all-MiniLM-L6-v2') -> Tuple[SentenceTransformer, Dict[str, np.ndarray]]:
-    st_model = init_sentence_transformer(model_name)
-    prompt_embeddings = {}
-    for field, prompts in FIELD_PROMPTS.items():
-        emb = st_model.encode(prompts, convert_to_numpy=True)
-        # average embedding for the set of prompts
-        prompt_embeddings[field] = emb.mean(axis=0)
-    return st_model, prompt_embeddings
-
-# -------------------------
-# Extraction helpers (no regex)
-# -------------------------
-
-def tokenize_text_into_sentences(text: str) -> List[str]:
-    # first split by lines and then NLTK sentence tokenizer
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    sents = []
-    for ln in lines:
+def extract_field(sentence: str, field: str, stanza_pipes: Dict[str, Any]) -> Tuple[Any, float]:
+    tokens = sentence.split()
+    ents = []
+    for pipe in stanza_pipes.values():
         try:
-            sents.extend(nltk.tokenize.sent_tokenize(ln))
-        except Exception:
-            sents.append(ln)
-    return sents
-
-
-def find_candidate_sentences_for_field(sents: List[str], prompt_emb: np.ndarray, st_model: SentenceTransformer, topk: int = 3) -> List[Tuple[str, float]]:
-    # embed sentences and compute cosine similarity
-    sent_embs = st_model.encode(sents, convert_to_numpy=True)
-    sims = cosine_similarity([prompt_emb], sent_embs)[0]
-    idx_sorted = np.argsort(-sims)
-    results = []
-    for idx in idx_sorted[:topk]:
-        results.append((sents[idx], float(sims[idx])))
-    return results
-
-
-def extract_digits_tokens(tokens: List[str]) -> List[str]:
-    # returns tokens that contain digits (helps capture things like FIR no: 123/2020)
-    out = []
-    for t in tokens:
-        if any(ch.isdigit() for ch in t):
-            out.append(t)
-    return out
-
-
-def join_adjacent_digit_tokens(tokens: List[str], start_idx: int) -> str:
-    # join a run of adjacent tokens that have digits or punctuation often found in ids
-    parts = []
-    for i in range(start_idx, len(tokens)):
-        t = tokens[i]
-        if any(ch.isdigit() for ch in t) or any(p in t for p in ['/', '-', '.']):
-            parts.append(t)
-        else:
-            break
-    return ' '.join(parts)
-
-
-def extract_value_from_sentence_by_field(sentence: str, field: str, stanza_pipelines: Dict[str, Any]) -> Tuple[Any, float]:
-    """Given a sentence and target field, try to extract the value and a confidence score.
-    Uses neural NER (stanza) for names/addresses and token-based heuristics for ids/years/sections.
-    """
-    # basic tokenization
-    tokens = [t.strip() for t in sentence.replace('\t', ' ').split(' ') if t.strip()]
-
-    # try language-specific NER via stanza (we'll try both pipelines to maximize recall)
-    def stanza_entities(sent: str) -> List[Tuple[str, str]]:
-        ents = []
-        for lang, pipe in stanza_pipelines.items():
-            try:
-                doc = pipe(sent)
-            except Exception:
-                continue
+            doc = pipe(sentence)
             for sentn in doc.sentences:
                 for ent in sentn.ents:
                     ents.append((ent.text, ent.type))
-        return ents
+        except Exception:
+            continue
 
-    ents = stanza_entities(sentence)
-
-    # field-specific extraction
-    if field == 'fir_no':
-        # look for tokens containing digits (e.g., 123/2022 or FIR/12345)
-        for i, t in enumerate(tokens):
-            if any(ch.isdigit() for ch in t):
-                candidate = join_adjacent_digit_tokens(tokens, i)
-                return candidate, 0.9
-        return None, 0.3
-
-    if field == 'year':
+    if field == "fir_no":
+        m = re.search(r"\b\d{1,5}/\d{4}\b", sentence)
+        if m:
+            return m.group(0), 0.95
+    if field == "year":
         for t in tokens:
-            if t.isdigit() and len(t) == 4:
-                y = int(t)
-                if 1900 <= y <= 2100:
-                    return str(y), 0.95
-        # as fallback, look for any 4-digit substring
-        for t in tokens:
-            digits = ''.join(ch for ch in t if ch.isdigit())
-            if len(digits) == 4:
-                y = int(digits)
-                if 1900 <= y <= 2100:
-                    return str(y), 0.8
-        return None, 0.2
-
-    if field in ('state_name', 'dist_name', 'police_station'):
-        # attempt to extract LOCATION-like entities from stanza
-        locs = [text for (text, label) in ents if label in ('GPE', 'LOC', 'ORG')]
+            if t.isdigit() and len(t) == 4 and 1900 <= int(t) <= 2100:
+                return t, 0.95
+    if field in ("state_name", "dist_name", "police_station"):
+        locs = [t for t, label in ents if label in ("GPE", "LOC", "ORG")]
         if locs:
             return locs[0], 0.9
-        # fallback: pick noun phrases (rough) by heuristics: consecutive titlecase tokens
-        title_tokens = [t for t in tokens if any(c.isalpha() for c in t) and t[0].isupper()]
-        if title_tokens:
-            return ' '.join(title_tokens[:3]), 0.5
-        return None, 0.2
-
-    if field in ('oparty', 'accused_name'):
-        persons = [text for (text, label) in ents if label in ('PERSON')]
+    if field in ("oparty", "accused_name"):
+        persons = [t for t, label in ents if label == "PERSON"]
         if persons:
-            return persons[0], 0.92
-        return None, 0.25
-
-    if field == 'address':
-        # addresses are often long; pick LOCATION/ORG entities or whole sentence
-        locs = [text for (text, label) in ents if label in ('GPE', 'LOC', 'ORG')]
+            return persons[0], 0.9
+    if field == "under_sections":
+        if "IPC" in sentence or "धारा" in sentence:
+            return sentence.strip(), 0.85
+    if field == "under_acts":
+        if any(w.upper() in ["IPC", "CRPC", "NDPS"] for w in tokens):
+            return sentence.strip(), 0.85
+    if field == "address":
+        locs = [t for t, label in ents if label in ("LOC", "GPE")]
         if locs:
-            return locs[0], 0.9
-        # fallback: return entire sentence as probable address
-        if any(ch.isdigit() for ch in sentence):
-            return sentence.strip(), 0.6
-        return None, 0.25
-
-    if field == 'under_acts':
-        # look for tokens like IPC or "Indian Penal Code" or Hindi equivalents
-        lower = sentence.lower()
-        if 'ipc' in lower or 'indian penal code' in lower or 'ipc' in sentence:
-            # return the phrase around IPC
-            return sentence.strip(), 0.85
-        hindi_tokens = ['भारतीय दंड संहिता', 'आईपीसी']
-        if any(ht in sentence for ht in hindi_tokens):
-            return sentence.strip(), 0.85
-        return None, 0.2
-
-    if field == 'under_sections':
-        # look for numeric tokens and tokens that contain digits; sections often have digits/commas
-        digit_tokens = extract_digits_tokens(tokens)
-        if digit_tokens:
-            return ', '.join(digit_tokens), 0.85
-        return None, 0.2
-
-    if field == 'revised_case_category':
-        # semantic classify by comparing against candidate categories via embedding (quick heuristic)
-        return sentence.strip(), 0.5
-
-    if field == 'jurisdiction':
+            return " ".join(locs), 0.85
+        if len(tokens) > 6:
+            return sentence.strip(), 0.5
+    if field == "jurisdiction":
         return sentence.strip(), 0.4
 
-    return None, 0.0
+    return None, 0.2
 
-# -------------------------
-# Main extractor combining steps
-# -------------------------
 
-def extract_pi_fields_from_text(text: str, stanza_pipelines: Dict[str, Any], st_model: SentenceTransformer, prompt_embs: Dict[str, np.ndarray]) -> Dict[str, Any]:
-    sents = tokenize_text_into_sentences(text)
-    results: Dict[str, Any] = {}
+def extract_all_fields(text: str, stanza_pipes, st_model) -> Dict[str, Any]:
+    sents = nltk.sent_tokenize(text)
+    results = {}
+    for field in FIELDS:
+        best_val, best_conf = None, 0
+        for sent in sents:
+            val, conf = extract_field(sent, field, stanza_pipes)
+            if conf > best_conf:
+                best_conf = conf
+                best_val = val
+        results[field] = {"value": best_val, "confidence": round(best_conf, 3)}
 
-    for field in FIELD_PROMPTS.keys():
-        candidates = find_candidate_sentences_for_field(sents, prompt_embs[field], st_model, topk=3)
-        best_value = None
-        best_conf = 0.0
-        # try candidates in order
-        for sent, score in candidates:
-            val, conf = extract_value_from_sentence_by_field(sent, field, stanza_pipelines)
-            combined_conf = float(score) * float(conf)
-            if val and combined_conf > best_conf:
-                best_conf = combined_conf
-                best_value = val
-        results[field] = {
-            'value': best_value,
-            'confidence': round(best_conf, 3)
-        }
-
-    # small post-processing: map jurisdiction type by heuristic
-    jur = results.get('jurisdiction', {}).get('value')
-    jtype = 'UNKNOWN'
-    if jur:
-        low = jur.lower()
-        if 'pan' in low or 'all india' in low or 'पैन' in low:
-            jtype = 'PAN_INDIA'
-        elif 'state' in low or 'राज्य' in low:
-            jtype = 'STATE'
-        elif 'district' in low or 'जिला' in low:
-            jtype = 'DISTRICT'
-        else:
-            jtype = 'UNKNOWN'
-    results['jurisdiction_type'] = jtype
+    # Add jurisdiction_type
+    jur = results.get("jurisdiction", {}).get("value") or ""
+    if "pan" in jur.lower() or "all india" in jur.lower():
+        results["jurisdiction_type"] = "PAN_INDIA"
+    elif "state" in jur.lower() or "राज्य" in jur:
+        results["jurisdiction_type"] = "STATE"
+    elif "district" in jur.lower() or "जिला" in jur:
+        results["jurisdiction_type"] = "DISTRICT"
+    else:
+        results["jurisdiction_type"] = "UNKNOWN"
 
     return results
 
-# -------------------------
-# Streamlit UI
-# -------------------------
 
+# -------------------------
+# Streamlit App
+# -------------------------
 def app():
-    st.set_page_config(page_title='FIR PII Extractor', layout='wide')
-    st.title('FIR PII Extractor — Hybrid (OCR + Neural NER + Semantic search)')
+    st.title("📄 FIR PII Extractor (Hybrid OCR + NER)")
+    st.markdown("Upload FIR PDFs in Hindi/English. Extracts PII using OCR + NLP.")
 
-    st.markdown('Upload an FIR PDF (Hindi/English). Tool will try digital extraction first, then OCR. Uses Stanza (neural NER) and sentence-transformers for semantic matching. No regex.')
+    ocr_backend = st.selectbox("Choose OCR Backend", ["tesseract", "google", "aws"])
+    file = st.file_uploader("Upload FIR PDF", type=["pdf"])
 
-    uploaded_file = st.file_uploader('Upload FIR PDF', type=['pdf'], accept_multiple_files=False)
-    if not uploaded_file:
-        st.info('Upload a PDF to get started')
-        st.stop()
+    if file:
+        raw = file.read()
+        with st.spinner("Extracting text..."):
+            text, images = extract_text_pdf(raw, ocr_backend)
 
-    raw_bytes = uploaded_file.read()
+        st.subheader("Extracted Text (preview)")
+        st.text_area("text", text[:2000], height=300)
 
-    with st.spinner('Extracting text (pdfplumber -> fitz -> OCR fallback) ...'):
-        text, page_images = extract_text_pdf_bytes(raw_bytes)
+        st.subheader("Page Preview")
+        st.image(images[0], caption="Page 1", use_column_width=True)
 
-    st.success('Text extraction done')
+        with st.spinner("Loading NLP models..."):
+            stanza_pipes = init_stanza()
+            st_model = init_st_model()
 
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        st.subheader('Extracted Text (first 1000 chars)')
-        st.text_area('extracted_text', value=text[:10000], height=300)
+        with st.spinner("Extracting PII..."):
+            results = extract_all_fields(text, stanza_pipes, st_model)
 
-    with col2:
-        st.subheader('Preview (page images)')
-        for i, img in enumerate(page_images[:3]):
-            st.image(img, caption=f'Page {i+1}', use_column_width=True)
+        st.subheader("Extracted PII Fields")
+        st.json(results)
 
-    # Initialize models
-    with st.spinner('Loading NLP models (stanza + sentence-transformers) ...'):
-        stanza_pipes = init_stanza_pipelines()
-        st_model, prompt_embs = build_prompt_embeddings()
-
-    with st.spinner('Running field extraction ...'):
-        extracted = extract_pi_fields_from_text(text, stanza_pipes, st_model, prompt_embs)
-
-    st.subheader('Extracted structured fields')
-    st.json(extracted)
-
-    st.markdown('---')
-    st.markdown('### Download Results')
-    btn = st.button('Download JSON')
-    if btn:
-        st.download_button('Download JSON', data=json.dumps(extracted, ensure_ascii=False, indent=2), file_name='fir_extracted.json', mime='application/json')
-
-    st.markdown('---')
-    st.header('Notes & next steps')
-    st.markdown(
-        """
-        * This pipeline is hybrid and intentionally avoids brittle regular expressions; it uses semantic search + neural NER.
-        * For best results in production: fine-tune a token-classification model (transformer) on labeled FIR data (Hindi+English) and plug into the pipeline.
-        * You can improve OCR by installing better Tesseract models or using an enterprise OCR (Google Vision / AWS Textract) if available.
-        * If you want, I can help convert this to a Dockerfile + requirements.txt and provide sample labeled data scripts for fine-tuning a model.
-        """
-    )
+        st.download_button("Download JSON", json.dumps(results, ensure_ascii=False, indent=2),
+                           file_name="fir_pii.json", mime="application/json")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app()
