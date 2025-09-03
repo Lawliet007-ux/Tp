@@ -9,3 +9,5 @@ numpy
 scikit-learn 
 opencv-python-headless 
 nltk
+boto3 
+google-cloud-vision 
